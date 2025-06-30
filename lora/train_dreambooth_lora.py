@@ -153,6 +153,26 @@ def parse_args(input_args=None):
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
+        "--before_data_dir",
+        type=str,
+        default=None,
+        required=False,
+        help="A folder containing the 'before' images for image pair training.",
+    )
+    parser.add_argument(
+        "--after_data_dir",
+        type=str,
+        default=None,
+        required=False,
+        help="A folder containing the 'after' images for image pair training.",
+    )
+    parser.add_argument(
+        "--use_image_pairs",
+        action="store_true",
+        default=False,
+        help="Whether to use image pair training mode (before/after images).",
+    )
+    parser.add_argument(
         "--class_data_dir",
         type=str,
         default=None,
@@ -568,37 +588,168 @@ class DreamBoothDataset(Dataset):
         return example
 
 
-def collate_fn(examples, with_prior_preservation=False):
+class ImagePairDataset(Dataset):
+    """
+    A dataset for training with multiple pairs of before/after images.
+    This dataset loads image pairs from two directories where filenames correspond.
+    """
+    
+    def __init__(
+        self,
+        before_data_root,
+        after_data_root,
+        instance_prompt,
+        tokenizer,
+        size=512,
+        center_crop=False,
+        encoder_hidden_states=None,
+        tokenizer_max_length=None,
+    ):
+        self.size = size
+        self.center_crop = center_crop
+        self.tokenizer = tokenizer
+        self.encoder_hidden_states = encoder_hidden_states
+        self.tokenizer_max_length = tokenizer_max_length
+        
+        # Load before images
+        self.before_data_root = Path(before_data_root)
+        if not self.before_data_root.exists():
+            raise ValueError("Before images root doesn't exist.")
+        
+        # Load after images
+        self.after_data_root = Path(after_data_root)
+        if not self.after_data_root.exists():
+            raise ValueError("After images root doesn't exist.")
+        
+        # Get all image files from both directories
+        self.before_images_path = [f for f in self.before_data_root.iterdir() 
+                                  if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp']]
+        self.after_images_path = [f for f in self.after_data_root.iterdir() 
+                                 if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp']]
+        
+        # Create filename mapping for after images
+        self.after_images_dict = {f.stem: f for f in self.after_images_path}
+        
+        # Filter before images to only include those with corresponding after images
+        self.image_pairs = []
+        for before_path in self.before_images_path:
+            after_path = self.after_images_dict.get(before_path.stem)
+            if after_path is not None:
+                self.image_pairs.append((before_path, after_path))
+        
+        if len(self.image_pairs) == 0:
+            raise ValueError("No matching image pairs found between before and after directories.")
+        
+        self.num_pairs = len(self.image_pairs)
+        self.instance_prompt = instance_prompt
+        self._length = self.num_pairs
+        
+        logger.info(f"Found {self.num_pairs} image pairs for training")
+        
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+    
+    def __len__(self):
+        return self._length
+    
+    def __getitem__(self, index):
+        example = {}
+        
+        # Load before image
+        before_path, after_path = self.image_pairs[index % self.num_pairs]
+        
+        before_image = Image.open(before_path)
+        before_image = exif_transpose(before_image)
+        if not before_image.mode == "RGB":
+            before_image = before_image.convert("RGB")
+        example["before_images"] = self.image_transforms(before_image)
+        
+        # Load after image
+        after_image = Image.open(after_path)
+        after_image = exif_transpose(after_image)
+        if not after_image.mode == "RGB":
+            after_image = after_image.convert("RGB")
+        example["after_images"] = self.image_transforms(after_image)
+        
+        # Process text prompt
+        if self.encoder_hidden_states is not None:
+            example["instance_prompt_ids"] = self.encoder_hidden_states
+        else:
+            text_inputs = tokenize_prompt(
+                self.tokenizer, self.instance_prompt, tokenizer_max_length=self.tokenizer_max_length
+            )
+            example["instance_prompt_ids"] = text_inputs.input_ids
+            example["instance_attention_mask"] = text_inputs.attention_mask
+        
+        return example
+
+
+def collate_fn(examples, with_prior_preservation=False, use_image_pairs=False):
     has_attention_mask = "instance_attention_mask" in examples[0]
 
-    input_ids = [example["instance_prompt_ids"] for example in examples]
-    pixel_values = [example["instance_images"] for example in examples]
+    if use_image_pairs:
+        # For image pair training, we have both before and after images
+        input_ids = [example["instance_prompt_ids"] for example in examples]
+        before_pixel_values = [example["before_images"] for example in examples]
+        after_pixel_values = [example["after_images"] for example in examples]
 
-    if has_attention_mask:
-        attention_mask = [example["instance_attention_mask"] for example in examples]
-
-    # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
-    if with_prior_preservation:
-        input_ids += [example["class_prompt_ids"] for example in examples]
-        pixel_values += [example["class_images"] for example in examples]
         if has_attention_mask:
-            attention_mask += [example["class_attention_mask"] for example in examples]
+            attention_mask = [example["instance_attention_mask"] for example in examples]
 
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        # Stack both before and after images
+        before_pixel_values = torch.stack(before_pixel_values)
+        after_pixel_values = torch.stack(after_pixel_values)
+        before_pixel_values = before_pixel_values.to(memory_format=torch.contiguous_format).float()
+        after_pixel_values = after_pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    input_ids = torch.cat(input_ids, dim=0)
+        input_ids = torch.cat(input_ids, dim=0)
 
-    batch = {
-        "input_ids": input_ids,
-        "pixel_values": pixel_values,
-    }
+        batch = {
+            "input_ids": input_ids,
+            "before_pixel_values": before_pixel_values,
+            "after_pixel_values": after_pixel_values,
+        }
 
-    if has_attention_mask:
-        batch["attention_mask"] = attention_mask
+        if has_attention_mask:
+            batch["attention_mask"] = attention_mask
 
-    return batch
+        return batch
+    else:
+        # Original DreamBooth logic
+        input_ids = [example["instance_prompt_ids"] for example in examples]
+        pixel_values = [example["instance_images"] for example in examples]
+
+        if has_attention_mask:
+            attention_mask = [example["instance_attention_mask"] for example in examples]
+
+        # Concat class and instance examples for prior preservation.
+        # We do this to avoid doing two forward passes.
+        if with_prior_preservation:
+            input_ids += [example["class_prompt_ids"] for example in examples]
+            pixel_values += [example["class_images"] for example in examples]
+            if has_attention_mask:
+                attention_mask += [example["class_attention_mask"] for example in examples]
+
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        input_ids = torch.cat(input_ids, dim=0)
+
+        batch = {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+        }
+
+        if has_attention_mask:
+            batch["attention_mask"] = attention_mask
+
+        return batch
 
 
 class PromptDataset(Dataset):
@@ -1010,25 +1161,42 @@ def main(args):
         pre_computed_instance_prompt_encoder_hidden_states = None
 
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        class_num=args.num_class_images,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-        encoder_hidden_states=pre_computed_encoder_hidden_states,
-        instance_prompt_encoder_hidden_states=pre_computed_instance_prompt_encoder_hidden_states,
-        tokenizer_max_length=args.tokenizer_max_length,
-    )
+    if args.use_image_pairs:
+        # Use image pair training mode
+        if args.before_data_dir is None or args.after_data_dir is None:
+            raise ValueError("Both --before_data_dir and --after_data_dir must be specified when using --use_image_pairs")
+        
+        train_dataset = ImagePairDataset(
+            before_data_root=args.before_data_dir,
+            after_data_root=args.after_data_dir,
+            instance_prompt=args.instance_prompt,
+            tokenizer=tokenizer,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            encoder_hidden_states=pre_computed_encoder_hidden_states,
+            tokenizer_max_length=args.tokenizer_max_length,
+        )
+    else:
+        # Use original DreamBooth mode
+        train_dataset = DreamBoothDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+            class_prompt=args.class_prompt,
+            class_num=args.num_class_images,
+            tokenizer=tokenizer,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            encoder_hidden_states=pre_computed_encoder_hidden_states,
+            instance_prompt_encoder_hidden_states=pre_computed_instance_prompt_encoder_hidden_states,
+            tokenizer_max_length=args.tokenizer_max_length,
+        )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation, args.use_image_pairs),
         num_workers=args.dataloader_num_workers,
     )
 
@@ -1125,7 +1293,18 @@ def main(args):
                 continue
 
             with accelerator.accumulate(unet):
-                pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+                if args.use_image_pairs:
+                    # For image pair training, we need to handle both before and after images
+                    before_pixel_values = batch["before_pixel_values"].to(dtype=weight_dtype)
+                    after_pixel_values = batch["after_pixel_values"].to(dtype=weight_dtype)
+                    
+                    # For now, we'll train on the after images as the target
+                    # You can modify this logic based on your specific needs
+                    pixel_values = after_pixel_values
+                else:
+                    # Original DreamBooth logic
+                    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+                
                 if vae is not None:
                     # Convert images to latent space
                     model_input = vae.encode(pixel_values).latent_dist
